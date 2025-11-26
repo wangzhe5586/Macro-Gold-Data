@@ -16,7 +16,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas requests openpyxl
+          pip install pandas requests openpyxl beautifulsoup4
 
       - name: Run macro data script
         run: python macro_data.py
