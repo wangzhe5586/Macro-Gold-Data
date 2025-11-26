@@ -1,367 +1,259 @@
 import os
 import re
 import time
-from io import BytesIO
 from datetime import datetime
+from io import BytesIO
 
-import pandas as pd
 import requests
+import pandas as pd
+from bs4 import BeautifulSoup
 
 
-# ======================
-# Telegram 发送函数
-# ======================
+# =========================
+# Telegram 基础函数
+# =========================
 
 TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("TG_CHAT_ID")
 
 
-def tg_send(text: str) -> None:
-    """发送文本到 Telegram，如果没配置环境变量就只打印"""
+def tg_send(text):
     if not TOKEN or not CHAT_ID:
-        print("【未配置 Telegram，以下为消息内容】")
-        print(text)
+        print("【未配置 TG】:\n", text)
         return
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        print("发送 Telegram 失败：", e)
-        print("响应：", resp.text)
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
 
-# ======================
-# 1. WGC 央行黄金储备（月度变动 TOP5）
-# ======================
+# =========================
+# 1. WGC（HTML解析，不依赖 lxml）
+# =========================
 
-def fetch_wgc() -> str:
-    """
-    从 WGC 网页读取 HTML 表格，自动找包含国家 + 多列数值的表，
-    用最后两列数值作为“近两个月储备”，计算差值，输出 TOP5 变化国家。
-    """
-    base = "https://www.gold.org"
-    page_url = base + "/goldhub/data/gold-reserves-by-country"
-    headers = {"User-Agent": "Mozilla/5.0"}
+def fetch_wgc():
+    url = "https://www.gold.org/goldhub/data/gold-reserves-by-country"
 
     try:
-        page = requests.get(page_url, headers=headers, timeout=30)
-        page.raise_for_status()
-        html = page.text
+        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # 解析页面中的所有表格
-        tables = pd.read_html(html)
+        # 找所有table
+        tables = soup.find_all("table")
         if not tables:
-            return "📒【央行储备】WGC 页面无可用表格。"
+            return "📒【央行储备】未找到数据表格（结构变动）"
 
-        target = None
-        for t in tables:
-            cols_lower = [str(c).lower() for c in t.columns]
-            if any("country" in c for c in cols_lower):
-                target = t
+        # 优先找包含“Country”的表头
+        target_df = None
+        for table in tables:
+            df = pd.read_html(str(table))[0]
+            cols = [str(c).lower() for c in df.columns]
+            if any("country" in c for c in cols):
+                target_df = df
                 break
 
-        if target is None:
-            return "📒【央行储备】未找到包含国家列的表格，可能是页面结构变动。"
+        if target_df is None:
+            return "📒【央行储备】未找到国家数据表（结构变动）"
 
-        df = target.copy()
+        df = target_df.copy()
 
-        # 第一列视为国家/地区
-        country_col = df.columns[0]
-
-        # 后续列尝试转为数值，选出数值列
-        df_num = df.copy()
-        for col in df_num.columns[1:]:
-            df_num[col] = (
-                df_num[col]
+        # 数值列处理
+        for col in df.columns[1:]:
+            df[col] = (
+                df[col]
                 .astype(str)
                 .str.replace(",", "")
-                .str.replace("\u2212", "-")  # 负号
-                .str.replace("–", "")
-                .str.replace("—", "")
+                .str.replace("–", "-")
+                .str.replace("—", "-")
+                .str.replace("\u2212", "-")
             )
-            df_num[col] = pd.to_numeric(df_num[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="ignore")
 
-        num_cols = [
-            c for c in df_num.columns[1:]
-            if df_num[c].notna().sum() > 10  # 至少有一些有效数字
-        ]
+        # 找出可以计算月度变化的数值列
+        num_cols = [c for c in df.columns[1:] if pd.to_numeric(df[c], errors="coerce").notna().sum() > 5]
+
         if len(num_cols) < 2:
-            return "📒【央行储备】未找到足够的数值列用于计算月度变化。"
+            return "📒【央行储备】表结构正常，但不足两列可对比"
 
-        # 取最后两列作为“上月 / 本月”
-        prev_col = num_cols[-2]
-        cur_col = num_cols[-1]
-
-        df_num["Change"] = df_num[cur_col] - df_num[prev_col]
-        tmp = df_num[[country_col, "Change"]].dropna().copy()
-        tmp["abs_change"] = tmp["Change"].abs()
-        top5 = tmp.sort_values("abs_change", ascending=False).head(5)
+        prev_col, cur_col = num_cols[-2], num_cols[-1]
+        df["Change"] = pd.to_numeric(df[cur_col], errors="coerce") - pd.to_numeric(df[prev_col], errors="coerce")
+        df["abs"] = df["Change"].abs()
+        top5 = df.sort_values("abs", ascending=False).head(5)
 
         lines = [
-            "📒【央行储备（月度变动 TOP5）】",
-            f"- 对比列：{prev_col} → {cur_col}（单位大致为吨）",
+            "📒【央行储备（月度TOP5）】",
+            f"- 对比列：{prev_col} → {cur_col}",
         ]
+
         for _, row in top5.iterrows():
-            name = str(row[country_col])
-            change = row["Change"]
-            lines.append(f"- {name}: {change:+.1f} 吨")
+            lines.append(f"- {row[df.columns[0]]}: {row['Change']:+.1f} 吨")
 
         return "\n".join(lines)
 
     except Exception as e:
-        return f"📒【央行储备】WGC 数据暂时无法解析月度变化，已跳过。\n原因：{e}"
+        return f"📒【央行储备】抓取失败：{e}"
 
 
-# ======================
-# 2. GLD ETF 持仓：日变动 + 近 5 日趋势
-# ======================
+# =========================
+# GLD（正常）
+# =========================
 
-def fetch_gld() -> str:
-    """
-    使用 SPDR 官方历史数据：
-    https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv
-
-    输出：
-    - 最新持仓（吨）
-    - 日变动
-    - 近 5 日累积变动
-    """
-    url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-
+def fetch_gld():
     try:
+        url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
         df = pd.read_csv(url)
-
-        if "Date" not in df.columns:
-            raise ValueError("GLD CSV 中不含 Date 列")
-
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.sort_values("Date")
 
-        tonne_cols = [c for c in df.columns if "Tonne" in c or "Tonnes" in c]
-        if not tonne_cols:
-            raise ValueError(f"未找到 Tonnes 列，现有列：{list(df.columns)}")
-        t_col = tonne_cols[0]
+        t_col = [c for c in df.columns if "Tonne" in c][0]
 
-        if len(df) < 5:
-            raise ValueError("GLD 历史数据不足 5 行")
-
-        last5 = df.tail(5).copy()
-        today_row = last5.iloc[-1]
-        prev_row = last5.iloc[-2]
-        first_row = last5.iloc[0]
-
-        today_date = today_row["Date"].strftime("%Y-%m-%d")
-        today_tonnes = float(today_row[t_col])
-        prev_tonnes = float(prev_row[t_col])
-        first_tonnes = float(first_row[t_col])
-
-        day_change = today_tonnes - prev_tonnes
-        five_change = today_tonnes - first_tonnes
-
-        text_lines = [
-            "📊【GLD ETF 持仓】全球最大黄金 ETF",
-            f"- 最新日期：{today_date}",
-            f"- 当前持仓：{today_tonnes:.2f} 吨",
-            f"- 日变动：{day_change:+.2f} 吨",
-            f"- 近 5 日累积：{five_change:+.2f} 吨",
-        ]
-        return "\n".join(text_lines)
-
-    except Exception as e:
-        return f"📊【GLD ETF 持仓】数据抓取失败，已跳过。\n原因：{e}"
-
-
-# ======================
-# 3. IAU ETF：价格 + 日变动 + 近 5 日价格趋势
-# ======================
-
-def fetch_iau() -> str:
-    """
-    使用 Stooq 免费日线数据：
-    https://stooq.com/q/d/l/?s=iau.us&i=d
-
-    输出：
-    - 最新收盘价
-    - 日价格变动（点数 + 百分比）
-    - 近 5 日累积价格变动
-    """
-    url = "https://stooq.com/q/d/l/?s=iau.us&i=d"
-
-    try:
-        df = pd.read_csv(url)
-        if len(df) < 5:
-            raise ValueError("IAU 历史数据不足 5 行")
-
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date")
-
-        last5 = df.tail(5).copy()
+        last5 = df.tail(5)
         today = last5.iloc[-1]
         prev = last5.iloc[-2]
         first = last5.iloc[0]
 
-        today_date = today["Date"].strftime("%Y-%m-%d")
-        today_close = float(today["Close"])
-        prev_close = float(prev["Close"])
-        first_close = float(first["Close"])
+        today_t = today[t_col]
+        prev_t = prev[t_col]
+        first_t = first[t_col]
 
-        day_change = today_close - prev_close
-        day_pct = day_change / prev_close * 100 if prev_close != 0 else 0.0
+        day_change = today_t - prev_t
+        five_change = today_t - first_t
 
-        five_change = today_close - first_close
-        five_pct = five_change / first_close * 100 if first_close != 0 else 0.0
-
-        text_lines = [
-            "📈【IAU ETF 价格】美国第二大黄金 ETF（价格参考）",
-            f"- 最新日期：{today_date}",
-            f"- 收盘价：{today_close:.2f} 美元",
-            f"- 日变动：{day_change:+.2f} 美元（{day_pct:+.2f}%）",
-            f"- 近 5 日：{five_change:+.2f} 美元（{five_pct:+.2f}%）",
-        ]
-        return "\n".join(text_lines)
+        return (
+            "📊【GLD ETF 持仓】全球最大黄金 ETF\n"
+            f"- 最新日期：{today['Date'].strftime('%Y-%m-%d')}\n"
+            f"- 当前持仓：{today_t:.2f} 吨\n"
+            f"- 日变动：{day_change:+.2f} 吨\n"
+            f"- 近5日：{five_change:+.2f} 吨"
+        )
 
     except Exception as e:
-        return f"📈【IAU ETF 价格】数据抓取失败，已跳过。\n原因：{e}"
+        return f"📊【GLD】失败：{e}"
 
 
-# ======================
-# 4. CFTC COT：黄金期货 Managed Money 净多头
-# ======================
+# =========================
+# IAU（正常）
+# =========================
 
-def fetch_cot() -> str:
-    """
-    使用 CFTC disaggregated futures-only 周度数据：
-    https://www.cftc.gov/dea/newcot/f_disagg.txt
+def fetch_iau():
+    try:
+        url = "https://stooq.com/q/d/l/?s=iau.us&i=d"
+        df = pd.read_csv(url)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date")
 
-    目标：
-    - 找到黄金合约行（包含 'GOLD' 的市场名称）
-    - 读取 Managed Money Long / Short，计算净多头
-    - 尝试读取本周变化（如果字段存在）
-    """
+        last5 = df.tail(5)
+        today = last5.iloc[-1]
+        prev = last5.iloc[-2]
+        first = last5.iloc[0]
+
+        today_p = today["Close"]
+        prev_p = prev["Close"]
+        first_p = first["Close"]
+
+        day = today_p - prev_p
+        day_pct = day / prev_p * 100
+
+        five = today_p - first_p
+        five_pct = five / first_p * 100
+
+        return (
+            "📈【IAU ETF 价格】美国第二大黄金ETF\n"
+            f"- 最新日期：{today['Date'].strftime('%Y-%m-%d')}\n"
+            f"- 收盘价：{today_p:.2f}\n"
+            f"- 日变动：{day:+.2f} ({day_pct:+.2f}%)\n"
+            f"- 近5日：{five:+.2f} ({five_pct:+.2f}%)"
+        )
+
+    except Exception as e:
+        return f"📈【IAU】失败：{e}"
+
+
+# =========================
+# 4. CFTC COT（兼容不同列名）
+# =========================
+
+def fetch_cot():
     url = "https://www.cftc.gov/dea/newcot/f_disagg.txt"
 
     try:
         df = pd.read_csv(url)
 
-        if "Market_and_Exchange_Names" not in df.columns:
-            raise ValueError("COT 文件中不含 Market_and_Exchange_Names 列")
+        # 动态识别合约名列
+        name_col = None
+        for c in df.columns:
+            if "Market" in c and "Exchange" in c:
+                name_col = c
+                break
 
-        gold_df = df[
-            df["Market_and_Exchange_Names"].str.contains("GOLD", case=False, na=False)
-        ]
+        if not name_col:
+            return "📑【CFTC COT】文件解析成功，但未识别到合约名列（结构变动）"
+
+        gold_df = df[df[name_col].astype(str).str.contains("GOLD", case=False, na=False)]
         if gold_df.empty:
-            return "📑【CFTC COT】未在最新 disaggregated 报告中找到黄金合约，已跳过。"
+            return "📑【CFTC COT】无黄金合约行（结构变动）"
 
-        last = gold_df.iloc[-1]
+        row = gold_df.iloc[-1]
 
-        # 报告日期
-        date_val = str(last.get("As_of_Date_In_Form_YYMMDD", ""))
+        # 日期解析
+        d = str(row.get("As_of_Date_In_Form_YYMMDD", ""))
         try:
-            date_val_int = int(float(date_val))
-            report_date = datetime.strptime(str(date_val_int), "%y%m%d").strftime(
-                "%Y-%m-%d"
-            )
-        except Exception:
-            report_date = date_val
+            d_int = int(float(d))
+            date = datetime.strptime(str(d_int), "%y%m%d").strftime("%Y-%m-%d")
+        except:
+            date = d
 
-        def get_float(series, name_list):
-            """尝试从若干候选列名中取出第一个能成功转成 float 的值"""
-            for name in name_list:
-                if name in series.index:
-                    try:
-                        return float(series[name])
-                    except Exception:
-                        continue
-            return None
+        # 动态识别 Managed Money 列
+        long = None
+        for c in df.columns:
+            if "M_Money_Long" in c or "Money_Mgt_Long" in c:
+                try:
+                    long = float(row[c])
+                    break
+                except:
+                    pass
 
-        mm_long = get_float(
-            last,
-            [
-                "M_Money_Long_All",
-                "M_Money_Long_All_Combin",
-                "Money_Mgt_Long_All",
-            ],
+        short = None
+        for c in df.columns:
+            if "M_Money_Short" in c or "Money_Mgt_Short" in c:
+                try:
+                    short = float(row[c])
+                    break
+                except:
+                    pass
+
+        if long is None or short is None:
+            return "📑【CFTC COT】无法解析多空头寸（字段名变动）"
+
+        net = long - short
+
+        return (
+            "📑【CFTC COT（黄金期货）】\n"
+            f"- 报告周：{date}\n"
+            f"- Managed Money 净多头：{net:,.0f} 手"
         )
-        mm_short = get_float(
-            last,
-            [
-                "M_Money_Short_All",
-                "M_Money_Short_All_Combin",
-                "Money_Mgt_Short_All",
-            ],
-        )
-
-        mm_long_chg = get_float(
-            last,
-            [
-                "M_Money_Long_All_Change",
-                "M_Money_Long_All_Chg",
-                "Money_Mgt_Long_All_Change",
-            ],
-        )
-        mm_short_chg = get_float(
-            last,
-            [
-                "M_Money_Short_All_Change",
-                "M_Money_Short_All_Chg",
-                "Money_Mgt_Short_All_Change",
-            ],
-        )
-
-        if mm_long is None or mm_short is None:
-            return "📑【CFTC COT】成功获取文件，但未能解析 Managed Money 多空头寸。"
-
-        mm_net = mm_long - mm_short
-        lines = [
-            "📑【CFTC COT（黄金期货）】",
-            f"- 报告周：{report_date}",
-            f"- Managed Money 净多头：{mm_net:,.0f} 手",
-        ]
-
-        if mm_long_chg is not None and mm_short_chg is not None:
-            mm_net_chg = mm_long_chg - mm_short_chg
-            lines.append(f"- 本周变化：{mm_net_chg:+,.0f} 手")
-
-        return "\n".join(lines)
 
     except Exception as e:
-        return f"📑【CFTC COT】数据抓取失败，已跳过。\n原因：{e}"
+        return f"📑【CFTC COT】抓取失败：{e}"
 
 
-# ======================
-# 主执行函数
-# ======================
+# =========================
+# Run
+# =========================
 
-def run() -> None:
+def run():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    parts = [f"🕒 黄金宏观数据库自动更新（UTC 日期：{today})", ""]
 
-    # 央行储备（月度 TOP5）
-    parts.append(fetch_wgc())
-    parts.append("")
+    msg = (
+        f"🕒 黄金宏观数据库自动更新（UTC：{today})\n\n"
+        f"{fetch_wgc()}\n\n"
+        f"{fetch_gld()}\n\n"
+        f"{fetch_iau()}\n\n"
+        f"{fetch_cot()}"
+    )
 
-    # GLD：持仓 + 日变动 + 近 5 日
-    parts.append(fetch_gld())
-    parts.append("")
-
-    # IAU：价格 + 日变动 + 近 5 日
-    parts.append(fetch_iau())
-    parts.append("")
-
-    # CFTC COT：黄金期货 Managed Money
-    parts.append(fetch_cot())
-
-    msg = "\n".join(parts)
     print(msg)
     tg_send(msg)
 
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        err_msg = f"❌ 宏观数据脚本出现未处理错误：{e}"
-        print(err_msg)
-        tg_send(err_msg)
+    run()
