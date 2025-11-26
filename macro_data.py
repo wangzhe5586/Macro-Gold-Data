@@ -6,16 +6,17 @@ from datetime import datetime
 
 
 # ======================
-# 0. Telegram 发送函数
+# Telegram 发送函数
 # ======================
+
 TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("TG_CHAT_ID")
 
 
-def tg_send(text: str):
-    """发送文本到 Telegram，如果环境变量没配置就只打印"""
+def tg_send(text: str) -> None:
+    """发送文本到 Telegram，如果没配置环境变量就只打印"""
     if not TOKEN or not CHAT_ID:
-        print("Telegram 配置缺失，消息内容如下：")
+        print("【未配置 Telegram，以下为消息内容】")
         print(text)
         return
 
@@ -25,12 +26,13 @@ def tg_send(text: str):
         resp.raise_for_status()
     except Exception as e:
         print("发送 Telegram 失败：", e)
-        print("响应内容：", resp.text)
+        print("响应：", resp.text)
 
 
 # ======================
-# 1. WGC 央行黄金储备
+# WGC 央行黄金储备
 # ======================
+
 def fetch_wgc() -> str:
     """
     抓取世界黄金协会 WGC 央行储备数据
@@ -43,11 +45,10 @@ def fetch_wgc() -> str:
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
 
-        # 指定 engine，避免 pandas 抱怨无法识别格式
+        # 指定 engine，避免 pandas 提示无法识别格式
         df = pd.read_excel(BytesIO(r.content), engine="openpyxl")
 
-        # 取最后一行作为最新数据（不同年份结构可能略有差异，这里只做简要展示）
-        latest = df.tail(1).T  # 转置便于阅读
+        latest = df.tail(1).T  # 取最后一行并转置，方便阅读
         text = "📒 WGC 央行黄金储备（最新一行原始数据）\n"
         text += latest.to_string(header=False)
         return text
@@ -57,16 +58,16 @@ def fetch_wgc() -> str:
 
 
 # ======================
-# 2. GLD ETF 持仓
+# GLD ETF 持仓
 # ======================
+
 def fetch_gld() -> str:
     """
-    抓取 GLD 官方 CSV，简单展示最后几行原始数据
-    不强行依赖某个字段名，主要防崩溃
+    抓取 GLD 官方 CSV，展示末尾几行原始数据
     """
     url = "https://www.spdrgoldshares.com/assets/daily-holdings/USD/fund-holdings-usd.csv"
     try:
-        df = pd.read_csv(url, skiprows=2)  # 官方文件前两行是说明
+        df = pd.read_csv(url, skiprows=2)  # 前两行是说明
         tail = df.tail(3)
         text = "📊 GLD ETF 持仓（末尾 3 行原始数据）\n"
         text += tail.to_string(index=False)
@@ -76,11 +77,12 @@ def fetch_gld() -> str:
 
 
 # ======================
-# 3. IAU ETF 持仓
+# IAU ETF 持仓
 # ======================
+
 def fetch_iau() -> str:
     """
-    抓取 IAU 官方 CSV，同样只展示末尾几行
+    抓取 IAU 官方 CSV，展示末尾几行原始数据
     """
     url = (
         "https://www.ishares.com/us/products/239561/ishares-gold-trust-fund/"
@@ -97,28 +99,28 @@ def fetch_iau() -> str:
 
 
 # ======================
-# 4. 主执行函数
+# 主执行函数
 # ======================
-def run():
+
+def run() -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    msg_parts = [f"🕒 黄金宏观数据库自动更新（UTC 日期：{today}）\n"]
+    parts = [f"🕒 黄金宏观数据库自动更新（UTC 日期：{today}）\n"]
 
-    # 各模块独立 try/except，任何一个挂掉都不影响整体
-    msg_parts.append(fetch_wgc())
-    msg_parts.append("")  # 空行
-    msg_parts.append(fetch_gld())
-    msg_parts.append("")
-    msg_parts.append(fetch_iau())
+    parts.append(fetch_wgc())
+    parts.append("")  # 空行
+    parts.append(fetch_gld())
+    parts.append("")
+    parts.append(fetch_iau())
 
-    final_msg = "\n".join(msg_parts)
-    print(final_msg)
-    tg_send(final_msg)
+    msg = "\n".join(parts)
+    print(msg)
+    tg_send(msg)
 
 
 if __name__ == "__main__":
     try:
         run()
     except Exception as e:
-        # 兜底：绝不让脚本因为未捕获异常而直接崩溃
         err_msg = f"❌ 宏观数据脚本出现未处理错误：{e}"
-        print(err_m_
+        print(err_msg)
+        tg_send(err_msg)
